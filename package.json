@@ -1,0 +1,1 @@
+{"name":"effect-contract-mvp","version":"0.1.0","private":true,"type":"module","scripts":{"test":"vitest run","test:watch":"vitest","build":"tsc -p tsconfig.json"},"dependencies":{"canonicalize":"^2.1.0"},"devDependencies":{"@types/node":"^22.0.0","typescript":"^5.8.0","vitest":"^3.2.0"}}

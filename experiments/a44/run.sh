@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# A44 spike: denied call under a SourceIdentity-tagged session. Sandbox accounts only.
+set -euo pipefail
+command -v jq >/dev/null || { echo "jq required"; exit 1; }
+: "${SANDBOX_ACCOUNT_ID:?set SANDBOX_ACCOUNT_ID}" "${SPIKE_ROLE_ARN:?set SPIKE_ROLE_ARN}"
+POLL_SECONDS="${POLL_SECONDS:-1800}"; POLL_EVERY="${POLL_EVERY:-20}"
+
+actual="$(aws sts get-caller-identity --query Account --output text)"
+[ "$actual" = "$SANDBOX_ACCOUNT_ID" ] || { echo "REFUSING: caller account $actual != $SANDBOX_ACCOUNT_ID"; exit 1; }
+
+CHANGE_ID="${CHANGE_ID:-CHG-SPIKE-$(date +%s)}"
+SESSION_NAME="spike-$CHANGE_ID"
+ROLE_NAME="effect-spike-$(date +%s)"
+# Stand-in for a compiled Effect Contract: only listing buckets is in-contract.
+SESSION_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*"}]}'
+TRUST="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${SANDBOX_ACCOUNT_ID}:root\"},\"Action\":\"sts:AssumeRole\"}]}"
+
+echo "== assume role with SourceIdentity=$CHANGE_ID"
+creds="$(aws sts assume-role --role-arn "$SPIKE_ROLE_ARN" --role-session-name "$SESSION_NAME" \
+  --source-identity "$CHANGE_ID" --policy "$SESSION_POLICY" --duration-seconds 900 --output json)"
+ADMIN_AK="${AWS_ACCESS_KEY_ID:-}"; ADMIN_SK="${AWS_SECRET_ACCESS_KEY:-}"; ADMIN_ST="${AWS_SESSION_TOKEN:-}"
+export AWS_ACCESS_KEY_ID="$(jq -r .Credentials.AccessKeyId <<<"$creds")"
+export AWS_SECRET_ACCESS_KEY="$(jq -r .Credentials.SecretAccessKey <<<"$creds")"
+export AWS_SESSION_TOKEN="$(jq -r .Credentials.SessionToken <<<"$creds")"
+
+echo "== in-contract call (expect success)"
+T_ALLOWED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+aws s3api list-buckets >/dev/null && echo "ListBuckets OK"
+
+echo "== out-of-contract call (expect AccessDenied)"
+T_CALL="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; START=$SECONDS
+set +e; out="$(aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document "$TRUST" 2>&1)"; rc=$?; set -e
+if [ "$rc" -eq 0 ]; then
+  echo "FAIL: CreateRole SUCCEEDED under a session policy that forbids it."
+  echo "Restoring the original credentials before cleanup."
+
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+  if [ -n "$ADMIN_AK" ]; then
+    export AWS_ACCESS_KEY_ID="$ADMIN_AK"
+    export AWS_SECRET_ACCESS_KEY="$ADMIN_SK"
+  fi
+
+  if [ -n "$ADMIN_ST" ]; then
+    export AWS_SESSION_TOKEN="$ADMIN_ST"
+  fi
+
+  aws iam delete-role --role-name "$ROLE_NAME" || {
+    echo "MANUAL CLEANUP REQUIRED: $ROLE_NAME"
+  }
+
+  exit 2
+fi
+echo "$out" | grep -q -E "AccessDenied|not authorized" || { echo "FAIL: unexpected error: $out"; exit 3; }
+echo "CreateRole denied as expected"
+
+# Back to admin credentials (or ambient profile) to read CloudTrail.
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+[ -n "$ADMIN_AK" ] && export AWS_ACCESS_KEY_ID="$ADMIN_AK" AWS_SECRET_ACCESS_KEY="$ADMIN_SK"
+[ -n "$ADMIN_ST" ] && export AWS_SESSION_TOKEN="$ADMIN_ST"
+
+lookup() { # $1=event name; IAM and STS-global events are recorded in us-east-1
+  aws cloudtrail lookup-events --region us-east-1 --start-time "$2" \
+    --lookup-attributes AttributeKey=EventName,AttributeValue="$1" --max-results 50 \
+    --query 'Events[].CloudTrailEvent' --output json |
+  jq -c --arg s "$SESSION_NAME" '.[] | fromjson | select((.userIdentity.arn // "") | contains($s))'
+}
+echo "== polling CloudTrail event history (up to ${POLL_SECONDS}s, every ${POLL_EVERY}s; expect minutes)"
+DENIED=""; WAITED=0
+while [ $WAITED -le "$POLL_SECONDS" ]; do
+  DENIED="$(lookup CreateRole "$T_CALL" | head -n1 || true)"
+  [ -n "$DENIED" ] && break
+  sleep "$POLL_EVERY"; WAITED=$((WAITED+POLL_EVERY)); printf '.'
+done; echo
+[ -n "$DENIED" ] || { echo "RESULT: denied CreateRole NOT visible in event history after ${POLL_SECONDS}s"; exit 4; }
+VIS=$((SECONDS-START))
+OUT_DIR="$(dirname "$0")/out"; mkdir -p "$OUT_DIR"
+jq . <<<"$DENIED" > "$OUT_DIR/denied-CreateRole.json"
+echo "raw denied event saved to $OUT_DIR/denied-CreateRole.json (contains your account id and ARNs: redact before sharing)"
+
+echo "== RESULT (denied call)"
+jq '{eventTime,eventName,errorCode,errorMessage,arn:.userIdentity.arn,
+     sourceIdentity:(.userIdentity.sessionContext.sourceIdentity // "ABSENT"),
+     lagSecondsAtDetection:(now - (.eventTime|fromdateiso8601)|floor)}' <<<"$DENIED"
+SI="$(jq -r '.userIdentity.sessionContext.sourceIdentity // "ABSENT"' <<<"$DENIED")"
+if [ "$SI" = "$CHANGE_ID" ]; then echo "VERDICT: SourceIdentity PRESENT on denied event -> ATTEMPTED-DENIED classification is viable"
+else echo "VERDICT: SourceIdentity $SI on denied event (expected $CHANGE_ID). Full userIdentity:"; jq .userIdentity <<<"$DENIED"; fi
+echo "seconds from denied call to visibility in event history: $VIS"
+
+echo "== comparison: allowed call event (ListBuckets)"
+ALLOWED="$(lookup ListBuckets "$T_ALLOWED" | head -n1 || true)"
+if [ -n "$ALLOWED" ]; then jq . <<<"$ALLOWED" > "$OUT_DIR/allowed-ListBuckets.json"; jq '{eventName,errorCode:(.errorCode // "none"),sourceIdentity:(.userIdentity.sessionContext.sourceIdentity // "ABSENT")}' <<<"$ALLOWED"
+else echo "ListBuckets event not found in us-east-1 yet (give it more time, or check the region where S3 recorded it)"; fi
+echo "Record these values in experiments/a44/RESULTS.md"
